@@ -14,11 +14,16 @@ from fastapi.responses import JSONResponse
 from app.config import CITY_NAME, get_settings
 from app.errors import AppError
 from app.models.schemas import ErrorBody, ErrorResponse
-from app.routes import areas, current, forecast, history, stations
+from app.rate_limit import RateLimitMiddleware
+from app.routes import accuracy, areas, current, forecast, history, stations
 from app.services.http_client import close_client
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# httpx logs every request at INFO including the full URL — which for these
+# providers means the API key lands in stdout, and in whatever collects it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
@@ -33,6 +38,11 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Added before CORS so it runs after it: a rejected request still carries the
+# headers the browser needs to read the 429 rather than reporting a network
+# error.
+app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,4 +97,5 @@ app.include_router(areas.router)
 app.include_router(current.router)
 app.include_router(history.router)
 app.include_router(forecast.router)
+app.include_router(accuracy.router)
 app.include_router(stations.router)

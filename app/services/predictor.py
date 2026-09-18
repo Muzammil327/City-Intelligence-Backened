@@ -190,6 +190,25 @@ def _fit_and_predict(
     )
 
 
+def fit_and_predict(
+    readings: list[HistoryPoint],
+    horizon_hours: int,
+    forecast_conditions: dict[datetime, HourlyConditions] | None = None,
+) -> ForecastResponse:
+    """Fit and predict synchronously, with no network access.
+
+    Public so the hindcast in `verification.py` can fit *this* model on a
+    truncated history rather than reimplementing it — a copy would drift and
+    then be measuring something the live endpoint does not use.
+
+    Omitting `forecast_conditions` makes the model carry the last known weather
+    forward, which is what a backtest wants: the real weather for those hours
+    exists in the held-out rows, and feeding it in would hand the model perfect
+    foresight.
+    """
+    return _fit_and_predict(readings, horizon_hours, forecast_conditions or {})
+
+
 async def forecast_aqi(readings: list[HistoryPoint], horizon_hours: int) -> ForecastResponse:
     """Fit on the supplied history and predict hourly AQI over the horizon.
 

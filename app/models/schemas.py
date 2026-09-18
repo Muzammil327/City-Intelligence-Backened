@@ -174,6 +174,40 @@ class ForecastResponse(ApiModel):
     points: list[ForecastPoint]
 
 
+class ForecastAccuracyPoint(ApiModel):
+    """One predicted hour set against the observation that actually followed."""
+
+    predicted_for: datetime
+    hours_ahead: int = Field(description="How far past the cut this hour sat.")
+    predicted_aqi: int
+    observed_aqi: int
+    error: int = Field(description="predicted - observed. Positive means over.")
+    predicted_category: str
+    observed_category: str
+
+
+class ForecastAccuracy(ApiModel):
+    """Hindcast skill: the model refit without the most recent hours, then
+    scored against them.
+
+    This is out-of-sample, unlike `ForecastResponse.r2_score`. Weather over the
+    scored window is carried forward rather than taken from the observations,
+    so the figures do not assume perfect knowledge of the future.
+    """
+
+    city: str
+    model: str
+    horizon_hours: int = Field(description="Hours actually scored, not requested.")
+    training_samples: int
+    evaluated_from: datetime
+    mean_absolute_error: float = Field(description="Average miss, in AQI points.")
+    root_mean_square_error: float
+    band_accuracy_pct: float = Field(
+        description="Share of hours landing in the correct EPA category."
+    )
+    points: list[ForecastAccuracyPoint]
+
+
 class Station(ApiModel):
     uid: str
     name: str

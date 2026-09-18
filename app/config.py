@@ -55,6 +55,16 @@ def _read_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _read_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _read_list(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -69,6 +79,7 @@ class Settings:
     aws_region: str
     dynamo_table_name: str
     persist_readings: bool
+    rate_limit_per_minute: int
     cors_origins: list[str] = field(default_factory=list)
 
     @property
@@ -96,5 +107,8 @@ def get_settings() -> Settings:
             "DYNAMO_TABLE_NAME", "city_intelligence_readings"
         ).strip(),
         persist_readings=_read_bool("PERSIST_READINGS", True),
+        # 0 or less switches limiting off, which is the documented way to
+        # disable it while developing.
+        rate_limit_per_minute=_read_int("RATE_LIMIT_PER_MINUTE", 60),
         cors_origins=_read_list("CORS_ORIGINS", ["http://localhost:3000"]),
     )

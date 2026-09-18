@@ -19,6 +19,7 @@ from app.models.schemas import (
 from app.services import (
     air_pollution_client,
     air_quality_client,
+    cache,
     dynamo_client,
     waqi_client,
     weather_client,
@@ -27,6 +28,11 @@ from app.services import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["current"])
+
+# The providers publish hourly; three upstream calls per page load bought
+# nothing. Persistence rides inside the loader, so a hit also means one stored
+# reading per window rather than one per request.
+CACHE_TTL_SECONDS = 5 * 60
 
 
 def _reading_from_waqi(waqi: WaqiReading) -> CurrentReading:
@@ -54,6 +60,10 @@ def _reading_from_waqi(waqi: WaqiReading) -> CurrentReading:
 
 @router.get("/current", response_model=CurrentReading, summary="Live AQI and weather")
 async def get_current() -> CurrentReading:
+    return await cache.cached("current", CACHE_TTL_SECONDS, _load_current)
+
+
+async def _load_current() -> CurrentReading:
     # All four are independent of one another, so they go out together.
     headline, weather, air_pollution, waqi = await asyncio.gather(
         air_quality_client.fetch_current_reading(),

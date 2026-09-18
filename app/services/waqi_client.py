@@ -17,7 +17,7 @@ from app.config import (
     READING_STALE_AFTER_HOURS,
     get_settings,
 )
-from app.errors import AppError, ConfigurationError, NotFoundError, UpstreamError
+from app.errors import AppError, ConfigurationError, UpstreamError
 from app.models.aqi import category_for_aqi
 from app.models.schemas import Pollutants, Station, WaqiReading
 from app.services.http_client import get_client
@@ -181,8 +181,11 @@ async def fetch_stations() -> list[Station]:
             )
         )
 
-    if not stations:
-        raise NotFoundError("No air quality stations were reported for this city.")
+    # An empty list is a valid answer, not a failure: WAQI reports no active
+    # station inside the city bounds, which is precisely why /areas reads a
+    # gridded model instead. Raising here made a normal condition look like an
+    # outage to every caller. A provider that is genuinely unreachable or
+    # returns something unreadable still raises, above.
 
     # Deterministic order: worst air first, then by name so ties do not shuffle.
     stations.sort(key=lambda s: (-(s.aqi or -1), s.name))
