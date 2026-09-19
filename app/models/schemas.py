@@ -208,6 +208,72 @@ class ForecastAccuracy(ApiModel):
     points: list[ForecastAccuracyPoint]
 
 
+# How an accuracy figure was arrived at.
+ACCURACY_BASIS_HINDCAST = "hindcast"
+ACCURACY_BASIS_VERIFIED = "verified"
+
+
+class StoredForecastPoint(ApiModel):
+    """One prediction, recorded at the moment it was made.
+
+    Kept so the service can answer the one question a hindcast cannot: how
+    close was the forecast actually served? `generated_at` is when the
+    prediction was made, `predicted_for` is the hour it describes, and the gap
+    between them is the lead time the number should be judged on.
+    """
+
+    predicted_for: datetime
+    generated_at: datetime
+    hours_ahead: int
+    predicted_aqi: int
+    predicted_category: str
+    model: str
+    weather_basis: str
+
+
+class AccuracySnapshot(ApiModel):
+    """One accuracy measurement, dated, so the figure can be trended.
+
+    `basis` says which question it answers:
+
+    * `hindcast` - the model refit without the most recent hours and scored
+      against them. Available immediately and backfillable over stored history,
+      but it measures a re-run rather than a forecast anyone was shown.
+    * `verified` - predictions this service actually published, scored against
+      the observations that later arrived. The honest number, and the one that
+      only accrues forward from the day recording started.
+
+    Both are reported separately and never averaged together.
+    """
+
+    recorded_at: datetime
+    basis: str = Field(description="'hindcast' or 'verified'.")
+    city: str
+    model: str
+    horizon_hours: int
+    training_samples: int
+    scored_points: int = Field(
+        description="Predicted hours that had an observation to score against."
+    )
+    mean_absolute_error: float = Field(description="Average miss, in AQI points.")
+    root_mean_square_error: float
+    band_accuracy_pct: float = Field(
+        description="Share of hours landing in the correct EPA category."
+    )
+
+
+class AccuracyHistoryResponse(ApiModel):
+    """How the model's skill has moved over time, newest first."""
+
+    city: str
+    count: int
+    bases: dict[str, int] = Field(
+        default_factory=dict,
+        description="How many returned snapshots came from each basis.",
+    )
+    snapshots: list[AccuracySnapshot]
+
+
 class Station(ApiModel):
     uid: str
     name: str

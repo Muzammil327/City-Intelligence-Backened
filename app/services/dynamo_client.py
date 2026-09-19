@@ -22,9 +22,16 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
-from app.config import CITY_SLUG, get_settings
+from app.config import CITY_NAME, CITY_SLUG, get_settings
 from app.errors import ConfigurationError, StaleReadingError, UpstreamError
-from app.models.schemas import CurrentReading, HistoryPoint, Weather
+from app.models.schemas import (
+    AccuracySnapshot,
+    CurrentReading,
+    ForecastResponse,
+    HistoryPoint,
+    StoredForecastPoint,
+    Weather,
+)
 from app.services.timestamps import parse_provider_timestamp
 
 logger = logging.getLogger(__name__)
@@ -172,3 +179,229 @@ async def put_reading(reading: CurrentReading, weather: Weather | None) -> None:
         await anyio.to_thread.run_sync(lambda: _get_table().put_item(Item=item))
     except (BotoCoreError, ClientError, NoCredentialsError) as exc:
         raise _wrap_boto_error(exc, "put") from exc
+
+
+# --- Forecast records and accuracy snapshots ---------------------------------
+#
+# Both live in the readings table, each under its own partition key value.
+#
+# The isolation is the point. `list_readings` queries `city = CITY_SLUG` with a
+# `Limit`, so a forecast or accuracy row sharing that partition would be counted
+# against that limit and then dropped for having no `aqi` - silently thinning
+# the model training window with no error raised anywhere. A distinct partition
+# value can never be returned by that query.
+#
+# The table sort key attribute is named `observed_at` and cannot be renamed, so
+# each partition stores a different kind of timestamp in it. The meaningful
+# fields travel as ordinary attributes alongside.
+
+_FORECAST_PARTITION = f"forecast#{CITY_SLUG}"
+_ACCURACY_PARTITION = f"accuracy#{CITY_SLUG}"
+
+# Separator inside the forecast sort key, and a sentinel that sorts above
+# anything which can follow it - so a range over target hours stays inclusive.
+_KEY_SEPARATOR = "#"
+_SORT_KEY_MAX = "\uffff"
+
+_FORECAST_ATTRIBUTES = (
+    "observed_at",
+    "predicted_for",
+    "generated_at",
+    "hours_ahead",
+    "predicted_aqi",
+    "predicted_category",
+    "model",
+    "weather_basis",
+)
+
+_ACCURACY_ATTRIBUTES = (
+    "observed_at",
+    "basis",
+    "model",
+    "horizon_hours",
+    "training_samples",
+    "scored_points",
+    "mean_absolute_error",
+    "root_mean_square_error",
+    "band_accuracy_pct",
+)
+
+
+def _hour_bucket(moment: datetime) -> datetime:
+    return moment.replace(minute=0, second=0, microsecond=0)
+
+
+def _forecast_sort_key(predicted_for: datetime, generated_at: datetime) -> str:
+    """Target hour first, so a range over target hours stays a key query.
+
+    `generated_at` is bucketed to the hour: a forecast refreshed several times
+    within one hour overwrites its own row rather than accumulating a near
+    duplicate per call, while a genuinely later run is kept as its own record.
+    """
+    return (
+        f"{predicted_for.isoformat()}"
+        f"{_KEY_SEPARATOR}"
+        f"{_hour_bucket(generated_at).isoformat()}"
+    )
+
+
+def _query_partition(
+    partition: str, attributes: tuple[str, ...], condition: Any, limit: int
+) -> list[dict[str, Any]]:
+    """One projected, bounded, newest-first key query. Reserved-word safe."""
+    names = {f"#{name}": name for name in attributes}
+    response = _get_table().query(
+        KeyConditionExpression=Key("city").eq(partition) & condition,
+        ProjectionExpression=", ".join(names.keys()),
+        ExpressionAttributeNames=names,
+        ScanIndexForward=False,  # newest first
+        Limit=limit,
+    )
+    return response.get("Items", [])
+
+
+def _write_forecast_points(forecast: ForecastResponse) -> None:
+    table = _get_table()
+    with table.batch_writer() as batch:
+        for offset, point in enumerate(forecast.points, start=1):
+            batch.put_item(
+                Item={
+                    "city": _FORECAST_PARTITION,
+                    "observed_at": _forecast_sort_key(
+                        point.predicted_for, forecast.generated_at
+                    ),
+                    "predicted_for": point.predicted_for.isoformat(),
+                    "generated_at": forecast.generated_at.isoformat(),
+                    "hours_ahead": offset,
+                    "predicted_aqi": _to_decimal(point.aqi),
+                    "predicted_category": point.category,
+                    "model": forecast.model,
+                    "weather_basis": forecast.weather_basis,
+                }
+            )
+
+
+async def put_forecast_points(forecast: ForecastResponse) -> None:
+    """Record what was predicted, as it was predicted.
+
+    Without this there is no way to score a forecast that was actually served -
+    only to re-run the model over history and score that instead.
+    """
+    if not forecast.points:
+        return
+    try:
+        await anyio.to_thread.run_sync(lambda: _write_forecast_points(forecast))
+    except (BotoCoreError, ClientError, NoCredentialsError) as exc:
+        raise _wrap_boto_error(exc, "forecast put") from exc
+
+
+def _item_to_forecast_point(item: dict[str, Any]) -> StoredForecastPoint | None:
+    predicted_for = parse_provider_timestamp(item.get("predicted_for"))
+    generated_at = parse_provider_timestamp(item.get("generated_at"))
+    predicted_aqi = _to_float(item.get("predicted_aqi"))
+    if predicted_for is None or generated_at is None or predicted_aqi is None:
+        return None
+    hours_ahead = _to_float(item.get("hours_ahead"))
+    return StoredForecastPoint(
+        predicted_for=predicted_for,
+        generated_at=generated_at,
+        hours_ahead=int(hours_ahead) if hours_ahead is not None else 0,
+        predicted_aqi=round(predicted_aqi),
+        predicted_category=str(item.get("predicted_category") or ""),
+        model=str(item.get("model") or ""),
+        weather_basis=str(item.get("weather_basis") or ""),
+    )
+
+
+async def list_forecast_points(
+    since: datetime, until: datetime, limit: int
+) -> list[StoredForecastPoint]:
+    """Recorded predictions whose target hour falls within [since, until]."""
+    condition = Key("observed_at").between(
+        since.isoformat(),
+        f"{until.isoformat()}{_KEY_SEPARATOR}{_SORT_KEY_MAX}",
+    )
+    try:
+        items = await anyio.to_thread.run_sync(
+            lambda: _query_partition(
+                _FORECAST_PARTITION, _FORECAST_ATTRIBUTES, condition, limit
+            )
+        )
+    except (BotoCoreError, ClientError, NoCredentialsError) as exc:
+        raise _wrap_boto_error(exc, "forecast query") from exc
+
+    return [point for point in map(_item_to_forecast_point, items) if point is not None]
+
+
+async def put_accuracy_snapshot(snapshot: AccuracySnapshot) -> None:
+    """Store one dated accuracy measurement. Overwrites the same timestamp."""
+    item = {
+        "city": _ACCURACY_PARTITION,
+        "observed_at": snapshot.recorded_at.isoformat(),
+        "basis": snapshot.basis,
+        "model": snapshot.model,
+        "horizon_hours": snapshot.horizon_hours,
+        "training_samples": snapshot.training_samples,
+        "scored_points": snapshot.scored_points,
+        "mean_absolute_error": _to_decimal(snapshot.mean_absolute_error),
+        "root_mean_square_error": _to_decimal(snapshot.root_mean_square_error),
+        "band_accuracy_pct": _to_decimal(snapshot.band_accuracy_pct),
+    }
+    try:
+        await anyio.to_thread.run_sync(lambda: _get_table().put_item(Item=item))
+    except (BotoCoreError, ClientError, NoCredentialsError) as exc:
+        raise _wrap_boto_error(exc, "accuracy put") from exc
+
+
+def _item_to_accuracy_snapshot(item: dict[str, Any]) -> AccuracySnapshot | None:
+    recorded_at = parse_provider_timestamp(item.get("observed_at"))
+    mean_absolute_error = _to_float(item.get("mean_absolute_error"))
+    root_mean_square_error = _to_float(item.get("root_mean_square_error"))
+    band_accuracy_pct = _to_float(item.get("band_accuracy_pct"))
+    if (
+        recorded_at is None
+        or mean_absolute_error is None
+        or root_mean_square_error is None
+        or band_accuracy_pct is None
+    ):
+        return None
+    horizon_hours = _to_float(item.get("horizon_hours")) or 0.0
+    training_samples = _to_float(item.get("training_samples")) or 0.0
+    scored_points = _to_float(item.get("scored_points")) or 0.0
+    return AccuracySnapshot(
+        recorded_at=recorded_at,
+        basis=str(item.get("basis") or ""),
+        city=CITY_NAME,
+        model=str(item.get("model") or ""),
+        horizon_hours=int(horizon_hours),
+        training_samples=int(training_samples),
+        scored_points=int(scored_points),
+        mean_absolute_error=mean_absolute_error,
+        root_mean_square_error=root_mean_square_error,
+        band_accuracy_pct=band_accuracy_pct,
+    )
+
+
+async def list_accuracy_snapshots(
+    limit: int, since: datetime | None = None
+) -> list[AccuracySnapshot]:
+    """Stored accuracy measurements, newest first. Always bounded by `limit`."""
+    condition = (
+        Key("observed_at").gte(since.isoformat())
+        if since is not None
+        else Key("observed_at").gt("")
+    )
+    try:
+        items = await anyio.to_thread.run_sync(
+            lambda: _query_partition(
+                _ACCURACY_PARTITION, _ACCURACY_ATTRIBUTES, condition, limit
+            )
+        )
+    except (BotoCoreError, ClientError, NoCredentialsError) as exc:
+        raise _wrap_boto_error(exc, "accuracy query") from exc
+
+    return [
+        snapshot
+        for snapshot in map(_item_to_accuracy_snapshot, items)
+        if snapshot is not None
+    ]

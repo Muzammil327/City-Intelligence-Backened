@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from app.models.schemas import ForecastResponse
-from app.services import cache, predictor
+from app.services import cache, predictor, verification
 from app.services import readings as readings_service
 
 router = APIRouter(tags=["forecast"])
@@ -32,6 +32,12 @@ async def get_forecast(
         history = await readings_service.load_readings(
             limit=TRAINING_WINDOW_HOURS, hours=TRAINING_WINDOW_HOURS
         )
-        return await predictor.forecast_aqi(history, horizon_hours=hours)
+        forecast = await predictor.forecast_aqi(history, horizon_hours=hours)
+        # Recorded inside the loader, so it runs once per cache window rather
+        # than once per request - the same arrangement /current uses. Without
+        # this there is no record of what was predicted, and accuracy can only
+        # ever be a hindcast.
+        await verification.record_forecast(forecast)
+        return forecast
 
     return await cache.cached(f"forecast:{hours}", CACHE_TTL_SECONDS, load)
