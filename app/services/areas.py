@@ -11,10 +11,10 @@ The city headline (`/current`) and the per-area feed are independent: the
 headline uses the city-centre point plus WAQI/OpenWeatherMap as before, and
 `/areas` is purely the neighbourhood grid.
 
-Overall summary calculation (documented - see below): the mean PM2.5 and PM10
-concentrations across every area with data are converted to US EPA sub-indices
-via `models/aqi.py`, and the overall AQI is the worst sub-index. This is one
-representative number for the city, not a measured value.
+Overall summary calculation (documented - see below): the mean of the area AQI
+values. Every area carries Open-Meteo's `us_aqi`, so the summary, the endpoints
+printed beside it and the city headline in /current are all the same index over
+the same pollutants. This is one representative number, not a measured value.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import httpx
 
 from app.config import CITY_NAME, NEIGHBORHOODS, READING_STALE_AFTER_HOURS, get_settings
 from app.errors import UpstreamError
-from app.models.aqi import category_for_aqi, aqi_from_pm10, aqi_from_pm25
+from app.models.aqi import category_for_aqi
 from app.models.schemas import (
     AreaReading,
     AreasResponse,
@@ -159,41 +159,33 @@ async def _fetch_area(name: str, latitude: float, longitude: float) -> AreaReadi
 def _overall(areas: list[AreaReading]) -> OverallSummary:
     """The city-wide summary from the area points.
 
-    Method (documented here and in the README): average the PM2.5 and PM10
-    concentrations across every area that reported them, convert each mean to
-    its US EPA sub-index, and take the worse of the two as the overall AQI.
-    Gases are excluded for the same reason as everywhere else in this service -
-    their EPA breakpoints need ppb/ppm while providers report ug/m3.
+    Method: the mean of the area AQI values. Each area carries Open-Meteo's
+    `us_aqi`, which is also what /current reports for the city point, so the
+    summary, the highest/lowest figures printed beside it and the headline
+    gauge are all the same index over the same pollutants.
+
+    This deliberately does *not* recompute an index from the mean PM2.5/PM10.
+    Doing that created a second, particulate-only definition of AQI: ozone and
+    the other gases are in `us_aqi` but were excluded here, so a city whose
+    worst area read Very Unhealthy could show a Moderate summary immediately
+    above it. Two numbers on one screen that could not both be true.
 
     The result is a representative number, never a point measurement.
     """
+    indices = [area.aqi for area in areas if area.aqi is not None]
+    mean_aqi = round(sum(indices) / len(indices)) if indices else None
+
+    # Reported beside the index for context, no longer used to derive it.
     pm25_values = [area.pm25 for area in areas if area.pm25 is not None]
-    pm10_values = [area.pm10 for area in areas if area.pm10 is not None]
-
-    candidates: list[tuple[int, str, float]] = []
-    if pm25_values:
-        mean_pm25 = sum(pm25_values) / len(pm25_values)
-        sub = aqi_from_pm25(mean_pm25)
-        if sub is not None:
-            candidates.append((sub, "pm25", mean_pm25))
-    if pm10_values:
-        mean_pm10 = sum(pm10_values) / len(pm10_values)
-        sub = aqi_from_pm10(mean_pm10)
-        if sub is not None:
-            candidates.append((sub, "pm10", mean_pm10))
-
-    # The worst sub-index wins; the reported concentration is the mean that
-    # produced it, so the summary stays internally consistent.
-    best = max(candidates, key=lambda pair: pair[0]) if candidates else None
-    overall_pm25 = next((mean for sub, pollutant, mean in candidates if pollutant == "pm25"), None)
+    overall_pm25 = sum(pm25_values) / len(pm25_values) if pm25_values else None
 
     ranked = sorted(areas, key=lambda area: area.aqi)
     lowest = ranked[0] if ranked else None
     highest = ranked[-1] if ranked else None
 
     return OverallSummary(
-        aqi=best[0] if best else 0,
-        category=category_for_aqi(best[0]) if best else "Good",
+        aqi=mean_aqi if mean_aqi is not None else 0,
+        category=category_for_aqi(mean_aqi) if mean_aqi is not None else "Good",
         pm25=overall_pm25,
         areas_with_data=len([area for area in areas if area.aqi is not None]),
         area_count=len(areas),

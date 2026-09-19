@@ -329,8 +329,9 @@ class OverallSummary(ApiModel):
     """One representative number for the city, from the area points.
 
     The calculation is documented in `services/areas.py` and the backend README;
-    it is a deliberate, named method (mean pollutant concentrations across the
-    areas, then the worst EPA sub-index), not an off-the-cuff average.
+    it is a deliberate, named method (the mean of the area US AQI values, the
+    same index the areas and the city headline use), not an off-the-cuff
+    average on a scale of its own.
     """
 
     aqi: int

@@ -134,13 +134,19 @@ city), so every area carries `source: "open-meteo-model"` and
 physical stations. The model's grid cells are ~9 km, so neighbouring areas can
 report the same value — that is the real resolution of the data, not a bug.
 
-**Overall summary — the documented calculation.** Averaging the PM2.5 and PM10
-concentrations across every area that reported them, converting each mean to its
-US EPA sub-index (EPA 2024 PM2.5 breakpoints, `models/aqi.py`), and taking the
-worse sub-index as the overall AQI. `overall.pm25` is the mean concentration that
-drove it. The result is one representative city number, never a point
-measurement. Gases are excluded for the same reason as everywhere else: their
-EPA breakpoints are defined in ppb/ppm while providers report µg/m³.
+**Overall summary — the documented calculation.** The mean of the area AQI
+values. Every area carries Open-Meteo's `us_aqi`, and so does the city headline
+from `/current`, so the summary, the high/low figures beside it and the headline
+gauge are one index over one set of pollutants. `overall.pm25` is the mean
+concentration, reported for context but no longer used to derive the index. The
+result is one representative city number, never a point measurement.
+
+This replaced an earlier method that rebuilt the index from the mean PM2.5/PM10
+alone. Because `us_aqi` includes ozone and the other gases and that calculation
+excluded them, the two disagreed: a city whose worst area read Very Unhealthy
+could show a Moderate summary directly beneath the gauge. Any future change here
+must keep the summary on the same index as `/current` and as the area points, or
+the dashboard contradicts itself again.
 
 ## Why Open-Meteo is the live source, not WAQI
 
